@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>CXD EEPROM Explorer</title>
+
+    <style>
+        body {
+            background-color: #eeeeee;
+            font-family: Arial, Helvetica, sans-serif;
+
+        }
+
+
+        #datatbl {
+            border-collapse: collapse;
+        }
+
+        #datatbl td,
+        #datatbl th {
+            border: 1px solid #ddd;
+            padding: 8px;
+        }
+
+        #datatbl tr:nth-child(even) {
+            background-color: #f2f2f2;
+        }
+
+        #datatbl tr:hover {
+            background-color: #ddd;
+        }
+
+        #datatbl th {
+            padding-top: 12px;
+            padding-bottom: 12px;
+            text-align: left;
+            background-color: #04AA6D;
+            color: white;
+        }
+        
+        #datatbl tr.reused {
+            color: grey;
+        }
+
+
+    </style>
+</head>
+
+<body>
+
+    <h1>CXD EEPROM Explorer</h1>
+
+    <tt>ROM:</tt> <input type="file" id="ROM" name="file"> <br>
+    <tt>RAM:</tt>  <input type="file" id="RAM" name="file"> <br><br>
+    <input type="button" onclick="read()" value="Read">
+
+    <br><br>
+
+    <table id="datatbl">
+        <thead>
+            <tr>
+                <th>Id</th>
+                <th>Label</th>
+                <th>Value</th>
+                <th>Pointer</th>
+            </tr>
+        </thead>
+        <tbody id="result_tbl">
+
+        </tbody>
+    </table>
+
+    <hr>
+
+    Simple program to dump test entries + set values from a RAM dump. Should work on Type-R and Type-S NetMD recorders.
+
+
+    <script type="text/javascript">
+        const RAM_OFFSET = 0x02000000;
+        const NEEDLE = new Uint8Array([0x00, 0x00, 0xcc, 0xcc, 0x4d, 0x61, 0x6e, 0x75, 0x61, 0x6c, 0x00, 0x00])
+
+        /////////////
+        // READING //
+        /////////////
+
+        function readBinaryFileAsync(file) {
+            return new Promise((resolve, reject) => {
+                let reader = new FileReader();
+
+                reader.onload = () => {
+                    resolve(reader.result);
+                };
+
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            })
+        }
+
+        async function read() {
+            let files_ram = document.getElementById('RAM').files;
+            let files_rom = document.getElementById('ROM').files;
+
+            if (!files_rom.length) {
+                alert('Need at least a ROM file!');
+
+                return;
+            }
+
+            let ram_file = files_ram[0];
+            let rom_file = files_rom[0];
+
+            let rom_data, ram_data;
+
+            try {
+                if(ram_file)
+                    ram_data = await readBinaryFileAsync(ram_file);
+                else
+                    ram_data = false;
+
+                rom_data = await readBinaryFileAsync(rom_file);
+            } catch (err) {
+                alert("Error while trying to read files: " + err.toString());
+                return;
+            }
+
+            findTestEntries(rom_data, ram_data);
+        }
+
+        /////////////
+        // PARSING //
+        /////////////
+
+        const TD = new TextDecoder("ascii");
+
+        function parseTestEntry(dv, i) {
+            return {
+                id: parseInt(dv.getUint16(i, true).toString(16)), // convert to correct number from bcd
+                max_val: dv.getUint8(i + 2),
+                min_val: dv.getUint8(i + 3),
+                label: TD.decode(dv.buffer.slice(i + 4, i + 12)).replaceAll("\x00", ""),
+
+                ptr_pretty_format: dv.getUint32(i + 12, true),
+                ptr_value: dv.getUint32(i + 16, true),
+                ptr_x: dv.getUint32(i + 20, true),
+                ptr_y: dv.getUint32(i + 24, true),
+                ptr_action: dv.getUint32(i + 28, true),
+            }
+        }
+
+        //////////////
+        // PRINTING //
+        //////////////
+
+
+        function printTestTbl(rom, idx, ram) {
+            const print_ram = !!ram;
+            if (print_ram)
+                ram = new Uint8Array(ram);
+
+            const res_tbl = document.getElementById("result_tbl");
+
+            let html = "";
+
+            let lastEntryId = -1;
+            let cnt = 0;
+
+            let ram_shared = new Map();
+
+            while (cnt++ < 1000) {
+                let entry = parseTestEntry(rom, idx);
+                idx += 32;
+
+                console.log(entry.id);
+
+                if (entry.id > lastEntryId) {
+                    lastEntryId = entry.id;
+                    let value_str = "Unknown";
+                    let style = "";
+
+                    if (print_ram && entry.ptr_value > RAM_OFFSET) {
+
+                        const value = ram[entry.ptr_value - RAM_OFFSET];
+                        value_str = "0x" + value.toString(16).padStart(2, 0);
+
+                        if (ram_shared.get(entry.ptr_value)) {
+                            value_str += " (reused)";
+                            style = "reused";
+                        }
+
+                        ram_shared.set(entry.ptr_value, true);
+                    }
+
+                    html += `
+                        <tr class="${style}">
+                            <td>${entry.id.toString().padStart(3, 0)}</td>
+                            <td>${entry.label}</td>
+                            <td>${value_str}</td>
+                            <td>0x${entry.ptr_value.toString(16).padStart(8, 0)}</td>
+                        </tr>
+                    `;
+                } else {
+                    break;
+                }
+            }
+
+            res_tbl.innerHTML = html;
+        }
+
+        ///////////////
+        // SEARCHING //
+        ///////////////
+
+
+        function findTestEntries(rom, ram) {
+            const rom_u8_version = new Uint8Array(rom);
+            const rom_dv_version = new DataView(rom);
+
+            const testTblIdx = rom_u8_version.findIndex((e, i, a) => {
+                for (let j = 0; j < NEEDLE.length; j++)
+                    if (a[i + j] === undefined || NEEDLE[j] != a[i + j])
+                        return false;
+
+                return true;
+            });
+
+            if (testTblIdx > 0) {
+                printTestTbl(rom_dv_version, testTblIdx, ram);
+            } else {
+                alert("Could not find test table index, make sure you have a correct rom file.");
+            }
+        }
+
+    </script>
+
+
+
+
+</body>
+
+</html>
